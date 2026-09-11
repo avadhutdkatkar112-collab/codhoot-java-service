@@ -1,9 +1,12 @@
-FROM eclipse-temurin:21-jdk-jammy
-
+FROM golang:1.22-bookworm AS builder
 WORKDIR /app
-COPY codhoot-java-service .
+COPY go.mod .
+COPY main.go .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o codhoot-java-service .
 
+FROM eclipse-temurin:21-jdk-jammy
+WORKDIR /app
+COPY --from=builder /app/codhoot-java-service .
 ENV PORT=8081
 EXPOSE 8081
-
 CMD ["./codhoot-java-service"]
