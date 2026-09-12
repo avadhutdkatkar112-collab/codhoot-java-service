@@ -18,8 +18,8 @@ import (
 const (
 	maxOutputSize    = 512 * 1024
 	maxSourceSize    = 100 * 1024
-	maxCompileTime   = 15 * time.Second
-	maxExecTime      = 10 * time.Second
+	maxCompileTime   = 25 * time.Second
+	maxExecTime      = 15 * time.Second
 	workspaceDir     = "/tmp/codhoot-workspace"
 )
 
@@ -181,7 +181,7 @@ func compileAndRun(jobDir, source string) (output string, exitCode int, compileM
 	execCtx, execCancel := context.WithTimeout(context.Background(), maxExecTime)
 	defer execCancel()
 
-	execCmd := exec.CommandContext(execCtx, "java", "-cp", jobDir, "Main")
+	execCmd := exec.CommandContext(execCtx, "java", "-Xmx64m", "-Xms32m", "-XX:+UseSerialGC", "-cp", jobDir, "Main")
 	var stdout, stderr strings.Builder
 	execCmd.Stdout = &stdout
 	execCmd.Stderr = &stderr
