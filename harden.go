@@ -12,13 +12,17 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -426,4 +430,75 @@ func writeEntry(dir string, ep entryPoint, uid uint32) (string, error) {
 		}
 	}
 	return filepath.Join(dir, ep.entry), nil
+}
+
+// VerifyHMAC authenticates calls from codhoot-backend.
+//
+// The service URLs are public on Render, so without this anyone can bypass the
+// backend entirely, including its per-IP rate limit. Signing binds three things
+// together: a timestamp, the path, and a hash of the exact request body.
+//
+// The body hash is the part that matters. Signing only timestamp+path means a
+// captured signature stays valid for *any* payload on that route inside the
+// drift window, which would defeat the point entirely.
+//
+// This is tamper-evident with a 30 second temporal bound, not replay-proof: an
+// identical request replayed inside the window still verifies. That is accepted
+// deliberately. Compilation is stateless and produces the same output for the
+// same input, so a replay grants no capability the attacker did not already have,
+// and a nonce would mean keeping per-request state in services that are
+// otherwise stateless.
+//
+// Fail-closed: if the shared secret is absent every request is refused. A
+// service that silently served anonymous traffic on a misconfigured deploy would
+// be the worst possible failure mode for this control.
+func VerifyHMAC(next http.Handler) http.Handler {
+	secret := []byte(os.Getenv("CODHOOT_INTERNAL_SECRET"))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(secret) == 0 {
+			http.Error(w, "Internal Server Error: missing CODHOOT_INTERNAL_SECRET", http.StatusInternalServerError)
+			return
+		}
+
+		timestampStr := r.Header.Get("X-CodHoot-Timestamp")
+		providedSig := r.Header.Get("X-CodHoot-Signature")
+		if timestampStr == "" || providedSig == "" {
+			http.Error(w, "Unauthorized: missing authentication headers", http.StatusUnauthorized)
+			return
+		}
+
+		// Both drift directions are rejected. The window is 30s rather than 5s
+		// because clock skew between Render and the backend otherwise produces
+		// intermittent 401s that are painful to diagnose.
+		ts, err := strconv.ParseInt(timestampStr, 10, 64)
+		now := time.Now().Unix()
+		if err != nil || now-ts > 30 || ts-now > 30 {
+			http.Error(w, "Unauthorized: request timestamp expired or invalid", http.StatusUnauthorized)
+			return
+		}
+
+		// Cap the body here, before buffering it. handleCompile also caps it via
+		// limitBody, but by then this middleware has already read the request, so
+		// without this an attacker could stream an arbitrarily large body into
+		// memory just to reach the signature check.
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Bad Request: body unreadable or exceeds size limit", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+
+		bodyHash := sha256.Sum256(body)
+		mac := hmac.New(sha256.New, secret)
+		mac.Write([]byte(timestampStr))
+		mac.Write([]byte(r.URL.Path))
+		mac.Write([]byte(hex.EncodeToString(bodyHash[:])))
+		if !hmac.Equal([]byte(providedSig), []byte(mac.Sum(nil))) {
+			http.Error(w, "Unauthorized: invalid signature", http.StatusUnauthorized)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
