@@ -31,6 +31,10 @@ const (
 
 type CompileRequest struct {
 	Source string `json:"source"`
+	// Files plus EntryFile enable the multi-file contract the backend uses.
+	// Source is still accepted so older callers keep working.
+	Files     map[string]string `json:"files,omitempty"`
+	EntryFile string            `json:"entry_file,omitempty"`
 }
 
 type CompileResponse struct {
@@ -227,9 +231,13 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if strings.TrimSpace(req.Source) == "" {
-		writeError(w, http.StatusBadRequest, "Source code is required", 0, 0)
-		return
+	// A multi-file request carries no source field; resolveEntry validates the
+	// file set instead, so these single-source checks apply only when it is absent.
+	if len(req.Files) == 0 {
+		if strings.TrimSpace(req.Source) == "" {
+			writeError(w, http.StatusBadRequest, "Source code is required", 0, 0)
+			return
+		}
 	}
 
 	if len(req.Source) > maxSourceSize {

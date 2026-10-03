@@ -12,8 +12,11 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
+	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -277,4 +280,117 @@ func mustReadFile(path string) []byte {
 		return nil
 	}
 	return b
+}
+
+// --- multi-file request handling ---------------------------------------------
+//
+// A request may arrive either as a single `source` string (the original
+// contract, still sent by older callers) or as a `files` map plus an
+// `entry_file`. Both must work because the service is reachable directly.
+//
+// Everything here is attacker controlled and reachable without authentication,
+// so the file set is validated in this layer as well as in the backend. A
+// validation bug in one layer must not become a sandbox escape in the other.
+
+const (
+	maxFiles      = 20
+	maxFileBytes  = 512 * 1024
+	maxTotalBytes = 2 * 1024 * 1024
+)
+
+// entryPoint is a validated request: the files to materialise, and the one that
+// actually runs.
+type entryPoint struct {
+	files map[string]string
+	entry string
+}
+
+// validFileName rejects anything that is not a plain single-segment file name.
+//
+// The name becomes a path inside a private job directory, so separators, parent
+// references, NUL bytes, control characters and over-long names are refused
+// outright rather than sanitised: no legitimate editor buffer contains them.
+func validFileName(name string) bool {
+	if name == "" || len(name) > 255 {
+		return false
+	}
+	if name == "." || name == ".." {
+		return false
+	}
+	if strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
+		return false
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveEntry validates a request into a set of files plus a single entry.
+//
+// Falling back to "the first file" when entry_file is absent would run a program
+// the caller did not ask for, which breaks the entry-point guarantee the
+// multi-file feature depends on, so it is refused instead.
+func resolveEntry(source string, files map[string]string, entryFile, defaultName string) (entryPoint, error) {
+	if len(files) == 0 {
+		if entryFile != "" {
+			return entryPoint{}, errors.New("entry_file given without files")
+		}
+		if len(source) > maxFileBytes {
+			return entryPoint{}, fmt.Errorf("source exceeds %d bytes", maxFileBytes)
+		}
+		return entryPoint{files: map[string]string{defaultName: source}, entry: defaultName}, nil
+	}
+
+	if len(files) > maxFiles {
+		return entryPoint{}, fmt.Errorf("too many files (max %d)", maxFiles)
+	}
+	total := 0
+	for name, content := range files {
+		if !validFileName(name) {
+			return entryPoint{}, errors.New("invalid file name")
+		}
+		if len(content) > maxFileBytes {
+			return entryPoint{}, fmt.Errorf("file %q exceeds %d bytes", name, maxFileBytes)
+		}
+		total += len(content)
+	}
+	if total > maxTotalBytes {
+		return entryPoint{}, fmt.Errorf("total source exceeds %d bytes", maxTotalBytes)
+	}
+
+	entry := entryFile
+	if entry == "" {
+		if len(files) != 1 {
+			return entryPoint{}, errors.New("entry_file is required when files has more than one entry")
+		}
+		for name := range files {
+			entry = name
+		}
+	}
+	if !validFileName(entry) {
+		return entryPoint{}, errors.New("invalid entry_file")
+	}
+	if _, ok := files[entry]; !ok {
+		return entryPoint{}, errors.New("entry_file is not present in files")
+	}
+	return entryPoint{files: files, entry: entry}, nil
+}
+
+// writeEntry materialises validated files into dir and returns the entry path.
+// dir must already be private to this job's uid. Files are chowned to the
+// sandbox uid because the service creates them as root.
+func writeEntry(dir string, ep entryPoint, uid uint32) (string, error) {
+	for name, content := range ep.files {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			return "", err
+		}
+		if err := chownToSandbox(path, uid); err != nil {
+			return "", err
+		}
+	}
+	return filepath.Join(dir, ep.entry), nil
 }
