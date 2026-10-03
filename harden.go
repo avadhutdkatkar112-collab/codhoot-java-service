@@ -494,7 +494,12 @@ func VerifyHMAC(next http.Handler) http.Handler {
 		mac.Write([]byte(timestampStr))
 		mac.Write([]byte(r.URL.Path))
 		mac.Write([]byte(hex.EncodeToString(bodyHash[:])))
-		if !hmac.Equal([]byte(providedSig), []byte(mac.Sum(nil))) {
+		// Decode the supplied signature before comparing. It arrives hex-encoded
+		// while mac.Sum returns raw bytes, and ConstantTimeCompare reports a
+		// mismatch on a length difference alone, so comparing the hex text
+		// directly against the digest rejects every request including valid ones.
+		provided, err := hex.DecodeString(providedSig)
+		if err != nil || !hmac.Equal(provided, mac.Sum(nil)) {
 			http.Error(w, "Unauthorized: invalid signature", http.StatusUnauthorized)
 			return
 		}

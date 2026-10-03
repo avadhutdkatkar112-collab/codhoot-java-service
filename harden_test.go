@@ -1,11 +1,19 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestCappedWriterBoundsMemory(t *testing.T) {
@@ -377,5 +385,129 @@ func TestMaxBodyBytesIsSmallerThanSourceLimit(t *testing.T) {
 	if maxBodyBytes <= maxSourceSize {
 		t.Fatalf("maxBodyBytes (%d) must exceed maxSourceSize (%d) so the JSON envelope is rejected rather than accepted and then truncated",
 			maxBodyBytes, maxSourceSize)
+	}
+}
+
+// --- HMAC middleware ---------------------------------------------------------
+
+func signRequest(t *testing.T, secret []byte, path, body string, skew int64) *http.Request {
+	t.Helper()
+	ts := strconv.FormatInt(time.Now().Unix()+skew, 10)
+	sum := sha256.Sum256([]byte(body))
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(ts))
+	mac.Write([]byte(path))
+	mac.Write([]byte(hex.EncodeToString(sum[:])))
+	r := httptest.NewRequest("POST", path, strings.NewReader(body))
+	r.Header.Set("X-CodHoot-Timestamp", ts)
+	r.Header.Set("X-CodHoot-Signature", hex.EncodeToString(mac.Sum(nil)))
+	return r
+}
+
+func TestVerifyHMACAcceptsValidSignature(t *testing.T) {
+	secret := []byte("test-secret")
+	t.Setenv("CODHOOT_INTERNAL_SECRET", string(secret))
+	h := VerifyHMAC(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.ReadAll(r.Body); err != nil {
+			t.Errorf("downstream could not read body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, signRequest(t, secret, "/compile", `{"source":"print(1)"}`, 0))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("valid signature rejected: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// The body hash is what stops a captured signature being reused for a different
+// payload, which is the whole point of signing the body.
+func TestVerifyHMACRejectsTamperedBody(t *testing.T) {
+	secret := []byte("test-secret")
+	t.Setenv("CODHOOT_INTERNAL_SECRET", string(secret))
+	h := VerifyHMAC(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	req := signRequest(t, secret, "/compile", `{"source":"print(1)"}`, 0)
+	req.Body = io.NopCloser(strings.NewReader(`{"source":"import os;os.system('id')"}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("tampered body accepted: status=%d", rec.Code)
+	}
+}
+
+func TestVerifyHMACRejectsWrongSecret(t *testing.T) {
+	t.Setenv("CODHOOT_INTERNAL_SECRET", "the-real-secret")
+	h := VerifyHMAC(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	req := signRequest(t, []byte("a-different-secret"), "/compile", `{"source":"x"}`, 0)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong-secret signature accepted: status=%d", rec.Code)
+	}
+}
+
+// A signature is bound to its path, so it cannot be moved to another route.
+func TestVerifyHMACRejectsPathSwap(t *testing.T) {
+	secret := []byte("test-secret")
+	t.Setenv("CODHOOT_INTERNAL_SECRET", string(secret))
+	h := VerifyHMAC(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	// Sign for one path but send the request to another. That is the actual
+	// attack; signing and sending the same path would only prove the happy path.
+	req := signRequest(t, secret, "/other", `{"source":"x"}`, 0)
+	req.URL.Path = "/compile"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("signature replayed onto a different path: status=%d", rec.Code)
+	}
+}
+
+func TestVerifyHMACRejectsStaleTimestamp(t *testing.T) {
+	secret := []byte("test-secret")
+	t.Setenv("CODHOOT_INTERNAL_SECRET", string(secret))
+	h := VerifyHMAC(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	for _, skew := range []int64{-120, 120} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signRequest(t, secret, "/compile", `{"source":"x"}`, skew))
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("timestamp skew %ds accepted: status=%d", skew, rec.Code)
+		}
+	}
+}
+
+func TestVerifyHMACRejectsMissingHeaders(t *testing.T) {
+	t.Setenv("CODHOOT_INTERNAL_SECRET", "s")
+	h := VerifyHMAC(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	r := httptest.NewRequest("POST", "/compile", strings.NewReader("{}"))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unsigned request accepted: status=%d", rec.Code)
+	}
+}
+
+// Fail-closed: a deploy that lost its secret must refuse traffic, never serve it.
+func TestVerifyHMACFailsClosedWithoutSecret(t *testing.T) {
+	t.Setenv("CODHOOT_INTERNAL_SECRET", "")
+	h := VerifyHMAC(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, signRequest(t, []byte("anything"), "/compile", `{"source":"x"}`, 0))
+	if rec.Code == http.StatusOK {
+		t.Fatal("service served traffic with no secret configured")
+	}
+}
+
+// The middleware buffers the body, so it must refuse an oversized one rather
+// than reading it into memory; otherwise the size limit in handleCompile is
+// bypassed simply by targeting this stage.
+func TestVerifyHMACCapsOversizedBody(t *testing.T) {
+	secret := []byte("s")
+	t.Setenv("CODHOOT_INTERNAL_SECRET", string(secret))
+	h := VerifyHMAC(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	body := `{"source":"` + strings.Repeat("A", maxBodyBytes+1024) + `"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, signRequest(t, secret, "/compile", body, 0))
+	if rec.Code == http.StatusOK {
+		t.Fatalf("oversized body accepted: %d bytes", len(body))
 	}
 }
