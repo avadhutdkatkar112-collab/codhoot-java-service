@@ -54,6 +54,11 @@ type HealthResponse struct {
 // every warm cache). Requests queue up to their own deadline instead.
 var jobSem = make(chan struct{}, maxConcurrentJobs)
 
+// uids hands each in-flight job its own sandbox uid so a job's working directory
+// is genuinely private to it. See harden.go for why a single shared uid is not
+// isolation.
+var uids = newUIDPool()
+
 // artifactCache is a tiny FIFO cache keyed by sha256(source) -> compiled binary.
 // Identical lesson/tutorial code is the dominant workload; compiling it once and
 // reusing the artifact turns repeat runs from seconds into milliseconds.
@@ -87,6 +92,11 @@ func cachePut(hash, path string) {
 }
 
 func main() {
+	// Sandboxed path: when re-invoked as the trampoline, apply rlimits and exec
+	// the real compiler or runtime. Returns only if the trampoline fails.
+	if sandboxExec() {
+		return
+	}
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8081"
@@ -156,20 +166,30 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 // runCommand runs a compiler/runner, killing the whole process group on
 // timeout so orphaned children (cc1, as, ld) never accumulate on the
 // 512MB container.
-func runCommand(parent context.Context, timeout time.Duration, dir string, name string, args ...string) ([]byte, int, bool) {
+func runCommand(parent context.Context, timeout time.Duration, dir string, uid uint32, name string, args ...string) ([]byte, int, bool) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, name, args...)
+	self, serr := selfPath()
+	if serr != nil {
+		return nil, -1, false
+	}
+
+	// Run the sandbox trampoline (this same binary), which applies rlimits and
+	// then execs the real target. That is how rlimits get applied at all, since
+	// Go's os/exec cannot set them in a child.
+	full := append([]string{sandboxExecFlag, name}, args...)
+	cmd := exec.CommandContext(ctx, self, full...)
 	cmd.Dir = dir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = childEnv(dir)
+	cmd.SysProcAttr = hardenProcAttr(uid)
 
 	killGroup := func() {
 		for i := 0; i < 200 && (cmd.Process == nil || cmd.Process.Pid <= 0); i++ {
 			time.Sleep(10 * time.Millisecond)
 		}
 		if cmd.Process != nil && cmd.Process.Pid > 0 {
-			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			killProcessGroup(cmd.Process.Pid)
 		}
 	}
 	go func() {
@@ -177,12 +197,19 @@ func runCommand(parent context.Context, timeout time.Duration, dir string, name 
 		killGroup()
 	}()
 
-	out, err := cmd.CombinedOutput()
+	// Stream into a bounded writer instead of CombinedOutput, which would buffer
+	// the program's entire output before any limit applied.
+	cw := &cappedWriter{max: maxOutputSize}
+	cmd.Stdout = cw
+	cmd.Stderr = cw
+	runErr := cmd.Run()
+
+	out := cw.Bytes()
 	if ctx.Err() == context.DeadlineExceeded {
 		return out, -1, true
 	}
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
+	if runErr != nil {
+		if ee, ok := runErr.(*exec.ExitError); ok {
 			return out, ee.ExitCode(), false
 		}
 		return out, 1, false
@@ -194,6 +221,7 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	var req CompileRequest
+	limitBody(w, r)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body", 0, 0)
 		return
@@ -224,12 +252,20 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 	hash := hex.EncodeToString(sum[:])
 	artifact, cacheHit := cacheGet(hash)
 
-	jobID := fmt.Sprintf("%d-%s", time.Now().UnixNano(), hash[:8])
-	jobDir := filepath.Join(workspaceDir, jobID)
-	os.MkdirAll(jobDir, 0755)
+	// Each job gets its own uid and a private random 0700 directory. Sharing one
+	// predictable directory let concurrent jobs read each other's source and
+	// rewrite it before it was executed.
+	uid := uids.acquire()
+	defer uids.release(uid)
+
+	jobDir, jerr := newJobDir(uid)
+	if jerr != nil {
+		writeError(w, http.StatusInternalServerError, "Failed to create workspace", 0, 0)
+		return
+	}
 	defer os.RemoveAll(jobDir)
 
-	compileMs, execMs, output, exitCode, timeout, truncated := compileAndRun(jobDir, req.Source, artifact, cacheHit, hash)
+	compileMs, execMs, output, exitCode, timeout, truncated := compileAndRun(uid, jobDir, req.Source, artifact, cacheHit, hash)
 
 	resp := CompileResponse{
 		Success:         exitCode == 0,
@@ -253,35 +289,65 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 		exitCode, compileMs, execMs, time.Since(start).Milliseconds(), timeout, cacheHit)
 }
 
-func compileAndRun(jobDir, source, cachedArtifact string, cacheHit bool, hash string) (compileMs, execMs int64, output string, exitCode int, timeout, truncated bool) {
+func compileAndRun(uid uint32, jobDir, source, cachedArtifact string, cacheHit bool, hash string) (compileMs, execMs int64, output string, exitCode int, timeout, truncated bool) {
 	srcFile := filepath.Join(jobDir, srcFilename)
 	if err := os.WriteFile(srcFile, []byte(source), 0644); err != nil {
 		return 0, 0, fmt.Sprintf("Failed to write source: %v", err), -1, false, false
 	}
+	// Hand the source to the sandbox uid so the unprivileged compiler can read it.
+	if err := chownToSandbox(srcFile, uid); err != nil {
+		return 0, 0, fmt.Sprintf("Failed to stage source: %v", err), -1, false, false
+	}
 
-	binFile := filepath.Join(jobDir, "output")
+	// javac writes a directory of class files, so the cache entry is sealed on the
+	// single Main.class it produces rather than on a directory tree. The class is
+	// always staged back into this job's own directory before running, so the
+	// classpath is never a shared, user-writable location.
 	compileOutput, compileCode, compileTimedOut := []byte{}, 0, false
 	compileStart := time.Now()
 
-	if cacheHit && cachedArtifact != "" {
-		binFile = cachedArtifact
+	classFile := filepath.Join(jobDir, "Main.class")
+	cacheClass := filepath.Join(cacheDir, hash+".class")
+
+	cached := false
+	if cacheHit && cachedArtifact != "" && verifyArtifact(cachedArtifact, source) {
+		cached = true
+	} else if verifyArtifact(cacheClass, source) {
+		cached = true
+	}
+
+	if !cached {
+		// Compile inside the job's private directory. javac is code that parses
+		// untrusted input, so it runs untrusted and confined there; only the
+		// service, which no request can reach, publishes to the shared cache.
+		compileOutput, compileCode, compileTimedOut = runCommand(
+			context.Background(), maxCompileTime, jobDir, uid,
+			"javac", "-d", jobDir, srcFile,
+		)
+		compileMs = time.Since(compileStart).Milliseconds()
+		if compileCode == 0 {
+			if blob, rerr := os.ReadFile(classFile); rerr == nil {
+				writeArtifact(cacheClass, source, blob)
+			}
+		}
 	} else {
-		// Compile into the persistent cache dir so the artifact survives across
-		// requests (jobDir is cleaned up after every run).
-		cacheArtifact := filepath.Join(cacheDir, hash)
-		if _, err := os.Stat(filepath.Join(cacheArtifact, "Main.class")); err == nil {
-			binFile = cacheArtifact
-			cachePut(hash, cacheArtifact)
+		if cacheHit && cachedArtifact != "" && verifyArtifact(cachedArtifact, source) {
+			blob, rerr := os.ReadFile(cachedArtifact)
+			if rerr == nil {
+				os.WriteFile(classFile, blob, 0644)
+			}
 		} else {
-			os.MkdirAll(cacheArtifact, 0755)
-			compileOutput, compileCode, compileTimedOut = runCommand(
-				context.Background(), maxCompileTime, jobDir,
-				"javac", "-d", cacheArtifact, srcFile,
-			)
-			compileMs = time.Since(compileStart).Milliseconds()
-			if compileCode == 0 {
-				cachePut(hash, cacheArtifact)
-				binFile = cacheArtifact
+			blob, rerr := os.ReadFile(cacheClass)
+			if rerr != nil {
+				// Unsealed or vanished: fall back to recompiling rather than run it.
+				compileOutput, compileCode, compileTimedOut = runCommand(
+					context.Background(), maxCompileTime, jobDir, uid,
+					"javac", "-d", jobDir, srcFile,
+				)
+				compileMs = time.Since(compileStart).Milliseconds()
+			} else {
+				os.WriteFile(classFile, blob, 0644)
+				cachePut(hash, cacheClass)
 			}
 		}
 	}
@@ -290,22 +356,22 @@ func compileAndRun(jobDir, source, cachedArtifact string, cacheHit bool, hash st
 		return compileMs, 0, "Compilation timed out (limit: 30s)", -1, true, false
 	}
 	if compileCode != 0 {
-		return compileMs, 0, string(compileOutput), compileCode, false, false
+		return compileMs, 0, sanitizeOutput(string(compileOutput), jobDir), compileCode, false, false
 	}
 
-	// Execute with the cached class dir on the classpath but a fresh per-request
-	// working directory so programs that write files stay isolated.
+	// Execute with only this job's own directory on the classpath, so programs
+	// that write files stay isolated and no shared cache dir is ever trusted.
 	execStart := time.Now()
 	execOutput, execCode, execTimedOut := runCommand(
-		context.Background(), maxExecTime, jobDir,
-		"java", "-Xmx64m", "-Xms32m", "-XX:+UseSerialGC", "-cp", binFile, "Main",
+		context.Background(), maxExecTime, jobDir, uid,
+		"java", "-Xmx64m", "-Xms32m", "-XX:+UseSerialGC", "-Djava.io.tmpdir="+jobDir, "-cp", jobDir, "Main",
 	)
 	execMs = time.Since(execStart).Milliseconds()
 	if execTimedOut {
 		return compileMs, execMs, "Execution timed out (limit: 15s)", -1, true, false
 	}
 
-	combinedOutput := string(execOutput)
+	combinedOutput := sanitizeOutput(string(execOutput), jobDir)
 	if len(combinedOutput) > maxOutputSize {
 		combinedOutput = combinedOutput[:maxOutputSize] + "\n... [output truncated]"
 		truncated = true
