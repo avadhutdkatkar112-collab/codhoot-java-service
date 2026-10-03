@@ -33,8 +33,8 @@ type CompileRequest struct {
 	Source string `json:"source"`
 	// Files plus EntryFile enable the multi-file contract the backend uses.
 	// Source is still accepted so older callers keep working.
-	Files     map[string]string `json:"files,omitempty"`
-	EntryFile string            `json:"entry_file,omitempty"`
+	Files     []File `json:"files,omitempty"`
+	EntryFile string `json:"entry_file,omitempty"`
 }
 
 type CompileResponse struct {
@@ -380,7 +380,7 @@ func compileAndRun(uid uint32, jobDir, source, cachedArtifact string, cacheHit b
 	}
 
 	combinedOutput := sanitizeOutput(string(execOutput), jobDir)
-	if len(combinedOutput) > maxOutputSize {
+	if len(combinedOutput) >= maxOutputSize {
 		combinedOutput = combinedOutput[:maxOutputSize] + "\n... [output truncated]"
 		truncated = true
 	}

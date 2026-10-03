@@ -298,10 +298,19 @@ const (
 	maxTotalBytes = 2 * 1024 * 1024
 )
 
+// File mirrors the backend's wire format exactly: codhoot-backend's
+// execution.File is `{name, content}` and Files is a *list*, not a map.
+// Accepting a map here would silently never match what the backend sends, so
+// the shape has to be identical.
+type File struct {
+	Name    string `json:"name"`
+	Content string `json:"content"`
+}
+
 // entryPoint is a validated request: the files to materialise, and the one that
 // actually runs.
 type entryPoint struct {
-	files map[string]string
+	files []File
 	entry string
 }
 
@@ -333,7 +342,7 @@ func validFileName(name string) bool {
 // Falling back to "the first file" when entry_file is absent would run a program
 // the caller did not ask for, which breaks the entry-point guarantee the
 // multi-file feature depends on, so it is refused instead.
-func resolveEntry(source string, files map[string]string, entryFile, defaultName string) (entryPoint, error) {
+func resolveEntry(source string, files []File, entryFile, defaultName string) (entryPoint, error) {
 	if len(files) == 0 {
 		if entryFile != "" {
 			return entryPoint{}, errors.New("entry_file given without files")
@@ -341,21 +350,28 @@ func resolveEntry(source string, files map[string]string, entryFile, defaultName
 		if len(source) > maxFileBytes {
 			return entryPoint{}, fmt.Errorf("source exceeds %d bytes", maxFileBytes)
 		}
-		return entryPoint{files: map[string]string{defaultName: source}, entry: defaultName}, nil
+		return entryPoint{files: []File{{Name: defaultName, Content: source}}, entry: defaultName}, nil
 	}
 
 	if len(files) > maxFiles {
 		return entryPoint{}, fmt.Errorf("too many files (max %d)", maxFiles)
 	}
 	total := 0
-	for name, content := range files {
-		if !validFileName(name) {
+	seen := make(map[string]bool, len(files))
+	for _, f := range files {
+		if !validFileName(f.Name) {
 			return entryPoint{}, errors.New("invalid file name")
 		}
-		if len(content) > maxFileBytes {
-			return entryPoint{}, fmt.Errorf("file %q exceeds %d bytes", name, maxFileBytes)
+		// A duplicate name would let a later file silently overwrite an earlier
+		// one, so the set the caller asked for is not the set that gets run.
+		if seen[f.Name] {
+			return entryPoint{}, fmt.Errorf("duplicate file name %q", f.Name)
 		}
-		total += len(content)
+		seen[f.Name] = true
+		if len(f.Content) > maxFileBytes {
+			return entryPoint{}, fmt.Errorf("file %q exceeds %d bytes", f.Name, maxFileBytes)
+		}
+		total += len(f.Content)
 	}
 	if total > maxTotalBytes {
 		return entryPoint{}, fmt.Errorf("total source exceeds %d bytes", maxTotalBytes)
@@ -366,14 +382,19 @@ func resolveEntry(source string, files map[string]string, entryFile, defaultName
 		if len(files) != 1 {
 			return entryPoint{}, errors.New("entry_file is required when files has more than one entry")
 		}
-		for name := range files {
-			entry = name
-		}
+		entry = files[0].Name
 	}
 	if !validFileName(entry) {
 		return entryPoint{}, errors.New("invalid entry_file")
 	}
-	if _, ok := files[entry]; !ok {
+	found := false
+	for _, f := range files {
+		if f.Name == entry {
+			found = true
+			break
+		}
+	}
+	if !found {
 		return entryPoint{}, errors.New("entry_file is not present in files")
 	}
 	return entryPoint{files: files, entry: entry}, nil
@@ -383,9 +404,9 @@ func resolveEntry(source string, files map[string]string, entryFile, defaultName
 // dir must already be private to this job's uid. Files are chowned to the
 // sandbox uid because the service creates them as root.
 func writeEntry(dir string, ep entryPoint, uid uint32) (string, error) {
-	for name, content := range ep.files {
-		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	for _, f := range ep.files {
+		path := filepath.Join(dir, f.Name)
+		if err := os.WriteFile(path, []byte(f.Content), 0o644); err != nil {
 			return "", err
 		}
 		if err := chownToSandbox(path, uid); err != nil {
