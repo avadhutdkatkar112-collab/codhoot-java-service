@@ -42,8 +42,21 @@ func sandboxExec() bool {
 		resource int
 		cur, max uint64
 	}{
+		// RLIMIT_NPROC caps how many tasks a sandbox uid may own. It is the only thing
+		// standing between a fork bomb and the service itself: a fork bomb in one job
+		// exhausts the cgroup pids budget, after which the Go runtime cannot create
+		// its own threads and the whole service dies with "fatal error: newosproc".
+		// That was observed under load before this limit was reinstated.
+		//
+		// It had briefly been removed on the belief that it broke the runtimes. That
+		// was a misdiagnosis: the EAGAIN failures came from host exhaustion, not from
+		// this limit. The value is 512 because the limit counts threads as well as
+		// processes and every job holds a *distinct* uid, so this is a per-job budget
+		// that a normal program never approaches: Node's libuv pool and V8 workers sit
+		// around 40, the JVM around 30, rustc under 15. A fork bomb still stops dead.
 		{syscall.RLIMIT_FSIZE, 32 << 20, 32 << 20}, // no unbounded file writes
 		{syscall.RLIMIT_CORE, 0, 0},                // no core dumps onto disk
+		{rlimitNproc, 512, 512},                    // fork bombs stop; runtimes unaffected
 	}
 	for _, l := range limits {
 		if err := syscall.Setrlimit(l.resource, &syscall.Rlimit{Cur: l.cur, Max: l.max}); err != nil {
@@ -70,6 +83,10 @@ func sandboxExec() bool {
 func killProcessGroup(pid int) error {
 	return syscall.Kill(-pid, syscall.SIGKILL)
 }
+
+// rlimitNproc is RLIMIT_NPROC, which Go's syscall package does not export.
+// The value is from the Linux ABI (include/uapi/linux/resource.h) and is stable.
+const rlimitNproc = 6
 
 // sandboxInnerUID is the uid the compiler/runtime sees *inside* its user
 // namespace. It is deliberately non-zero so that a program which refuses to run
