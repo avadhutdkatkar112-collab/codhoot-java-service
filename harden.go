@@ -187,6 +187,18 @@ var toolchainEnvKeys = []string{
 	"NODE_PATH",
 	"NODE_OPTIONS",
 	"PYTHONHOME",
+	// Toolchain caches. These must reach the child or a pre-warmed cache baked
+	// into the image is never used: Go falls back to a per-job HOME cache and
+	// rebuilds the whole standard library on every request, which measured 4848ms
+	// for hello-world. CCACHE_DIR and RUSTC_WRAPPER do the same job for C, C++
+	// and Rust.
+	"GOCACHE",
+	"GOMODCACHE",
+	"GOFLAGS",
+	"GOPROXY",
+	"CCACHE_DIR",
+	"RUSTC_WRAPPER",
+	"SCCACHE_DIR",
 }
 
 // hostEnvAllowlist returns the toolchain variables this service actually has.

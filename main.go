@@ -23,7 +23,7 @@ const (
 	maxSourceSize     = 100 * 1024 // 100KB
 	maxCompileTime    = 30 * time.Second
 	maxExecTime       = 15 * time.Second
-	maxConcurrentJobs = 4
+	maxConcurrentJobs = 8
 	workspaceDir      = "/tmp/codhoot-workspace"
 	cacheDir          = "/tmp/codhoot-cache"
 	srcFilename       = "Main.java"
