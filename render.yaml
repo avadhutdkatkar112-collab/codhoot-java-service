@@ -1,0 +1,37 @@
+# CodHoot Java execution service — Render blueprint.
+#
+# This repository IS the execution server. One service per language, one repo
+# per service, so a single language can be built, scaled, pinned or rolled
+# back without touching the other seven.
+#
+# Contract with codhoot-backend (internal/execution):
+#   POST /compile   signed with HMAC(timestamp + path + sha256(body)) keyed by
+#                   CODHOOT_INTERNAL_SECRET. Unsigned or tampered requests get
+#                   401 — the service refuses every unauthenticated call.
+#   GET /health     and /health/live stay open: Render health checks and the
+#                   keepalive pinger must never need a signature.
+#
+# Free-tier notes: the instance sleeps after ~15 min of no traffic, so the
+# first compile after idle pays a cold start (up to 30-60 s). The backend
+# treats HTML and transient 5xx on /compile as "waking up" and retries, and
+# codhoot-keepalive exists to avoid the sleep entirely.
+services:
+  - type: web
+    name: codhoot-java-service
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    region: oregon
+    branch: master
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      # Render routes traffic to the port the service listens on; the image
+      # defaults to 8081, so pin it here instead of relying on the image.
+      - key: PORT
+        value: "10000"
+      # Must be the SAME value as the backend's CODHOOT_INTERNAL_SECRET:
+      # it is the HMAC key that makes signed requests verifiable.
+      - key: CODHOOT_INTERNAL_SECRET
+        sync: false
