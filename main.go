@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,14 +20,13 @@ import (
 )
 
 const (
-	maxOutputSize     = 512 * 1024 // 512KB
-	maxSourceSize     = 100 * 1024 // 100KB
-	maxCompileTime    = 30 * time.Second
-	maxExecTime       = 15 * time.Second
-	maxConcurrentJobs = 8
-	workspaceDir      = "/tmp/codhoot-workspace"
-	cacheDir          = "/tmp/codhoot-cache"
-	srcFilename       = "Main.java"
+	maxOutputSize  = 512 * 1024 // 512KB
+	maxSourceSize  = 100 * 1024 // 100KB
+	maxCompileTime = 30 * time.Second
+	maxExecTime    = 15 * time.Second
+	workspaceDir   = "/tmp/codhoot-workspace"
+	cacheDir       = "/tmp/codhoot-cache"
+	srcFilename    = "Main.java"
 )
 
 type CompileRequest struct {
@@ -53,9 +53,29 @@ type HealthResponse struct {
 	Timestamp string `json:"timestamp"`
 }
 
-// jobSem bounds concurrent compiler+runner processes so a burst of students
-// cannot OOM the 512MB free-tier container (which would restart it and wipe
-// every warm cache). Requests queue up to their own deadline instead.
+// maxConcurrentJobs bounds concurrent compiler+runner processes so a burst of
+// students cannot OOM the 512MB free-tier container (which would restart it and
+// wipe every warm cache). Requests queue up to their own deadline instead.
+//
+// The default is this language's COMPILER_CONCURRENCY_* on the backend, so the
+// service remains the ceiling even if that configuration drifts upward: the box
+// is 0.1 CPU with 512 MB, and each in-flight toolchain costs both a timeslice
+// and real memory. MAX_CONCURRENT_JOBS overrides it per deployment.
+var maxConcurrentJobs = concurrentJobsFromEnv(1)
+
+// concurrentJobsFromEnv reads MAX_CONCURRENT_JOBS, clamped to 1..8 so a typo
+// cannot silently remove the ceiling.
+func concurrentJobsFromEnv(def int) int {
+	n, err := strconv.Atoi(os.Getenv("MAX_CONCURRENT_JOBS"))
+	if err != nil || n < 1 {
+		return def
+	}
+	if n > 8 {
+		return 8
+	}
+	return n
+}
+
 var jobSem = make(chan struct{}, maxConcurrentJobs)
 
 // uids hands each in-flight job its own sandbox uid so a job's working directory
@@ -132,7 +152,7 @@ func main() {
 		Addr:         ":" + port,
 		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: maxCompileTime + 10*time.Second,
+		WriteTimeout: maxCompileTime + maxExecTime + 20*time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
